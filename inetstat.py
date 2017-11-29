@@ -103,7 +103,10 @@ def get_process_info(pid_number):
 
     _name = process_status_dict['Name']
     _umask = umask_human_representation(process_status_dict['Umask'])
-    _state = re.findall(process_state_pattern, process_status_dict['State'])[0]
+    if "(" and ")" in process_status_dict['State']:
+        _state = re.findall(process_state_pattern, process_status_dict['State'])[0]
+    else:
+        _state = process_status_dict['State']
     _threads = process_status_dict['Threads']
     _mem = process_status_dict['VmRSS']
     return {'pname': _name, 'pumask': _umask, 'pstate': _state, 'th': _threads, 'pmem': _mem}

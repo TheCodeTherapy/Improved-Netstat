@@ -27,14 +27,19 @@ running_arch = "{0} bits".format(8 * struct.calcsize("P"))
 threads_available = int(cpu_count() / 2) + 1
 
 system_pid_pattern = '/proc/[0-9]*/fd/[0-9]*'
+process_state_pattern = re.compile(r"\(([A-Za-z0-9_]+)\)")
 sc_clk_tck = os.sysconf_names['SC_CLK_TCK']
 clock_tick = os.sysconf(sc_clk_tck)
 
 kernel_tcp4_info = '/proc/net/tcp'
-tcp_timers = {'00': 'no_timer', '01': 'retransmit', '02': 'keep_alive', '03': 'time_wait', '04': 'window_probe'}
+tcp_timers = {'00': 'z_no_timer', '01': 'retransmit', '02': 'keep_alive', '03': 'time_wait', '04': 'window_probe'}
 
 tcp_states = {'01': 'ESTABLISHED', '02': 'SYN_SENT', '03': 'SYN_RECV', '04': 'FIN_WAIT1', '05': 'FIN_WAIT2',
               '06': 'TIME_WAIT', '07': 'CLOSE', '08': 'CLOSE_WAIT', '09': 'LAST_ACK', '0A': 'LISTEN', '0B': 'CLOSING'}
+
+umask_octal_codes = {'0': 'rwx', '1': 'rw-', '2': 'r-x', '3': 'r--', '4': '-wx', '5': '-w-', '6': '--x', '7': '---'}
+
+umask_special_bits = {'0': '', '1': 'Sticky', '2': 'SGID', '4': 'SUID'}
 
 
 def split_lists(original_list, max_slices):
@@ -68,12 +73,48 @@ def get_pid_of_inode(inode):
             return '-NA-'
 
 
+def umask_human_representation(umask):
+    """ Returns a string with a human readable representation of a given umask """
+    _machine_reading_umask = str(umask)[::-1]
+    _other = umask_octal_codes[_machine_reading_umask[0]]
+    _group = umask_octal_codes[_machine_reading_umask[1]]
+    _user = umask_octal_codes[_machine_reading_umask[2]]
+    try:
+        _special = umask_special_bits[_machine_reading_umask[3]]
+    except IndexError:
+        _special = ''
+    human_readable_umask = "{0}{1}{2}{3}".format(_special, _user, _group, _other)
+    return human_readable_umask
+
+
+def get_process_info(pid_number):
+    """ Check relevant data about a given process using it's Kernel representation on /proc filesystem. It returns the
+     process Name, State, Threads owned by it, VmRSS memory taken by it and it's permissions """
+    process_status_file = "/proc/{0}/status".format(str(pid_number))
+    process_status_dict = dict()
+    try:
+        with open(process_status_file, 'r') as proc_status:
+            _status = proc_status.readlines()
+            for _item in _status:
+                _item, _value = [i.lstrip().rstrip() for i in _item.split(":")]
+                process_status_dict.update({_item: _value})
+    except IOError:
+        return {'pname': '---', 'pumask': '---', 'pstate': '---', 'th': '---', 'pmem': '---'}
+
+    _name = process_status_dict['Name']
+    _umask = umask_human_representation(process_status_dict['Umask'])
+    _state = re.findall(process_state_pattern, process_status_dict['State'])[0]
+    _threads = process_status_dict['Threads']
+    _mem = process_status_dict['VmRSS']
+    return {'pname': _name, 'pumask': _umask, 'pstate': _state, 'th': _threads, 'pmem': _mem}
+
+
 def timers_and_jiffies(tcp_timer, jiffy):
-    """ Use Kernel constant values for clock in Hz and estimate jiffies based time from /proc/net/tcp. It returns the
-     timer_type, the timer countdown itself, and the int(max_length) of the timer_type (useful for pretty printing) """
+    """ Use Kernel constant values for clock in Hz and the jiffy values given by /proc/net/tcp to describe the type of
+    timer (tcp_timer_type) associated with a connection and it's current time countdown in seconds (tcp_timer) """
     tcp_timer_type = tcp_timers[tcp_timer]
     _time = int(int(hex2dec(jiffy)) / clock_tick)  # int int to round secs (human-readable value)
-    tcp_timer = "{0}s".format(_time) if _time > 0 else '--'
+    tcp_timer = _time if _time > 0 else 0
     return tcp_timer_type, tcp_timer
 
 
@@ -83,9 +124,8 @@ class MinimalWhois(object):
         """ This is my minimalistic whois implementation using sockets. It's inherited by INetStat class, and it's
         purpose is to return ASN related information against a given IP address """
 
-        self.host = "whois.cymru.com"
-        self.whois_port = 43
-        self.ipcheck_port = 80
+        self.whois_host = "whois.cymru.com"
+        self.whois_port, self.ipcheck_port = 43, 80
         self.ipcheck_address = "8.8.8.8"
 
         self.timeout = 2
@@ -114,7 +154,7 @@ class MinimalWhois(object):
         _response = b''
         try:
             self.socket.settimeout(self.timeout)
-            self.socket.connect((self.host, self.whois_port))
+            self.socket.connect((self.whois_host, self.whois_port))
             self.socket.send(bytes(self.object_flags.format(ip_address).encode()))
 
             while True:
@@ -135,7 +175,6 @@ class MinimalWhois(object):
         _retries = 3
         _whois_data = self.lookup(ip_address)
         while _whois_data is None and _retries > 0:
-            print("Retrying ip {0} after it's time out in 3 seconds!".format(ip_address))
             _retries -= 1
             _whois_data = self.lookup(ip_address)
 
@@ -176,6 +215,7 @@ class MinimalNetstat(MinimalWhois):
     def parse_tcp4_data(self):
         """ Get information about all currently available IPv4 TCP connections using the read_proc_tcp4 method and
         parse the information through some conversion methods as per Linux Kernel conventions """
+        _status_keys = ['pname', 'pumask', 'pstate', 'th', 'pmem']
         _tcp4_data = dict()
         _data = self.read_proc_tcp4()
         if _data is None:
@@ -195,7 +235,7 @@ class MinimalNetstat(MinimalWhois):
             if _remote_host != '0.0.0.0':
 
                 _layer = 'secure' if _remote_port == '443' else 'insecure'
-                _state = self.states[_cells[3]]
+                _cstate = self.states[_cells[3]]
 
                 _timer, _jiffy = _cells[5].split(':')
                 _timer_type, _timer = timers_and_jiffies(_timer, _jiffy)
@@ -205,16 +245,20 @@ class MinimalNetstat(MinimalWhois):
                 _inode = _cells[9]
                 _inode_pid = get_pid_of_inode(_inode)
 
+                _pid_status = get_process_info(_inode_pid)
+                _pname, _pumask, _pstate, _th, _pmem = [_pid_status[_ps_key] for _ps_key in _status_keys]
+
+                _pname = _pname[:11] if len(_pname) > 11 else _pname
+
                 try:
-                    _app = os.readlink("/proc/{0}/exe".format(_inode_pid))  # .split(os.path.sep)[-1]
+                    _app_path = os.readlink("/proc/{0}/exe".format(_inode_pid))  # .split(os.path.sep)[-1]
                 except FileNotFoundError:
-                    _app = '--NA--'
+                    _app_path = '--NA--'
 
-                _app = _app.split(os.path.sep)[-1] if len(_app) > 30 else _app
-
-                _tcp4_entry = {'id': _id, 'state': _state, 'localhost': _local_host, 'lport': _local_port,
+                _tcp4_entry = {'id': _id, 'cstate': _cstate, 'localhost': _local_host, 'lport': _local_port,
                                'remotehost': _remote_host, 'rport': _remote_port, 'time': _timer, 'timer': _timer_type,
-                               'user': _uid, 'inode': _inode, 'pid': _inode_pid, 'app': _app, 'layer': _layer,
+                               'user': _uid, 'inode': _inode, 'pid': _inode_pid, 'name': _pname, 'app_path': _app_path,
+                               'umask': _pumask, 'pstate': _pstate, 'th': _th, 'mem': _pmem, 'layer': _layer,
                                'ipv': 'IPv4'}
 
                 _tcp4_data.update({_remote_host: _tcp4_entry})
@@ -247,8 +291,7 @@ class PickleDict:
                 with open(self.my_pickle, 'rb') as _pickle:
                     return pickle.load(_pickle)
             except IOError:
-                print("Can't read {0} file (inaccessible or corrupt)!".format(self.my_pickle))
-                sys.exit(1)
+                return False
         else:
             return False
 
@@ -279,7 +322,9 @@ class INetstat(MinimalNetstat):
             self.netstat[mutual_key] = {**self.netstat[mutual_key], **self.asn_data[mutual_key]}
 
         def sort_items(dictionary):
-            return dictionary[1]['as_name'], dictionary[1]['timer']
+            return dictionary[1]['ipv'], dictionary[1]['rport'], dictionary[1]['cstate'], dictionary[1]['timer'],\
+                   dictionary[1]['time'], dictionary[1]['as_name'], dictionary[1]['cc'], dictionary[1]['allocated'],\
+                   dictionary[1]['remotehost']
 
         _netstat_sorted_items = sorted(self.netstat.items(), key=sort_items)
         self.ordered_netstat = OrderedDict(_netstat_sorted_items)
@@ -324,25 +369,25 @@ class INetstat(MinimalNetstat):
         return _complete_asn_data
 
 
-def dict_values_len(dictionary):
+def dict_values_len(dictionary, minimum_column_size=5):
     """ Reads the given dictionary and return a new one containing each one of it's keys with it's correspondent length,
     which represents whe length of the largest value attributed to that same key"""
     _values_len_dict = dict()
     for k, v in dictionary.items():
         for _k, _v in v.items():
+            _v = str(_v)
             if _k not in _values_len_dict or _values_len_dict[_k] < len(_v):
-                _length = len(_v) if len(_v) >= 5 else 5
+                _length = len(_v) if len(_v) >= minimum_column_size else minimum_column_size
                 _values_len_dict.update({_k: _length})
     return _values_len_dict
 
 
 def pretty_print(string, string_type=None):
     """ Take care of determining which fields should be justified to each side to improve readability """
+    string = str(string)
     _string_length = pprint_dict[string_type] if string_type is not None else pprint_dict[string]
-    _right_justified_strings = ['localhost', 'remotehost', 'timer', 'bgp_prefix']
-    if string_type is not None and string_type in _right_justified_strings:
-        return string.rjust(_string_length)
-    elif not string_type and string in _right_justified_strings:
+    _right_justified_strings = ['localhost', 'remotehost', 'mem', 'timer', 'bgp_prefix']
+    if string in _right_justified_strings or string_type in _right_justified_strings:
         return string.rjust(_string_length)
     else:
         return string.ljust(_string_length)
@@ -350,17 +395,17 @@ def pretty_print(string, string_type=None):
 
 def print_inetstat():
     """ Print inetstat results to the terminal """
-    keys_to_print = ['localhost', 'lport', 'state', 'remotehost', 'rport', 'layer', 'ipv', 'pid', 'app', 'timer',
-                     'time', 'cc', 'allocated', 'bgp_prefix', 'as_name']
+    keys_to_print = ['localhost', 'lport', 'cstate', 'remotehost', 'rport', 'layer', 'ipv', 'pid', 'name', 'umask',
+                     'pstate', 'th', 'mem', 'timer', 'time', 'cc', 'allocated', 'bgp_prefix', 'as_name']
 
     for key in keys_to_print:
         print(pretty_print(key), end=' ')
-    sys.stdout.write('\n')
+    print()
 
     for key, value in inetstat_dict.items():
         for _key in keys_to_print:
             print(pretty_print(value[_key], _key), end=' ')
-        sys.stdout.write('\n')
+        print()
 
 
 if __name__ == "__main__":

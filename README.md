@@ -2,7 +2,7 @@
 
 This is a netstat + whois that I wrote to replace the Linux's netstat as it better fits my needs. Besides showing all the current IPv4 connections, it shows some extra information that can't be obtained using Linux's netstat.
 
-![](http://mgz.me/wp-content/uploads/2017/11/inetstat_working_2.gif)
+![](http://mgz.me//blog/wp-content/uploads/2017/11/inetstat_working_2.gif)
 
 * Both netstat and whois features are self implemented through reading the proc filesystem and sockets (respectively), so the code does not need to execute none of those Linux command line tools;
 * Local IP address is also obtained by establishing a socket connection with a fast response DNS server and getting it's own connection name, to prevent undesired local IP address as 127.0.0.1;
